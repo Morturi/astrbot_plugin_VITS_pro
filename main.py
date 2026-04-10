@@ -984,14 +984,15 @@ class VITSPlugin(Star):
 @dataclass
 class VITSTool(FunctionTool[AstrAgentContext]):
     name: str = "vits_speech_synthesis" 
-    description: str = "将文本转为语音发送的工具。当用户明确要求你发语音、说话、或你需要用语音表达情感时调用。"
+    # 优化 1：在描述中严厉警告模型，规范其行为
+    description: str = "将文本转为语音发送的工具。当用户明确要求你发语音、说话或表达情感时调用。注意：每次回复【仅限调用一次】，请将所有要说的话合并到一起传入！调用成功后请直接结束回复，切勿重复调用！"
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": "需要转换为语音的纯文本。如果你需要表达情绪，必须在正文开头加上情绪指令前缀，格式为：[情绪词] emotion<|endofprompt|>[正文]。支持的情绪词有：happy, excited, sad, angry。例如：'happy emotion<|endofprompt|>今天天气真好！'",
+                    "description": "需要转换为语音的纯文本。务必将所有要说的话合并成一段完整的长文本传入。如果你需要表达情绪，必须在正文开头加上情绪指令前缀，格式为：[情绪词] emotion<|endofprompt|>[正文]。支持的情绪词有：happy, excited, sad, angry。例如：'happy emotion<|endofprompt|>今天天气真好！'",
                 }
             },
             "required": ["text"],
@@ -1003,6 +1004,14 @@ class VITSTool(FunctionTool[AstrAgentContext]):
     async def call(
         self, context: ContextWrapper[AstrAgentContext], **kwargs
     ) -> ToolExecResult:
+        # 优化 2：单次回复防重复调用锁（硬拦截）
+        if context.context.event.get_extra("vits_tool_called"):
+            logger.warning("大模型尝试重复调用语音工具，已拦截")
+            return "错误：你已经在此次回复中调用过语音工具了！请立即停止调用，并直接结束你的对话回复。"
+        
+        # 标记为已调用
+        context.context.event.set_extra("vits_tool_called", True)
+
         text = kwargs.get("text")
         
         if not self.plugin:
@@ -1046,7 +1055,8 @@ class VITSTool(FunctionTool[AstrAgentContext]):
                 except Exception:
                     pass
                     
-                return "语音发送成功"
+                # 优化 3：工具返回结果中再次诱导大模型停止思考
+                return "语音发送成功，请立即结束本次对话回复，不要再输出任何后续内容。"
             else:
                 return "语音合成失败"
         except Exception as e:
