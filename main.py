@@ -984,15 +984,15 @@ class VITSPlugin(Star):
 @dataclass
 class VITSTool(FunctionTool[AstrAgentContext]):
     name: str = "vits_speech_synthesis" 
-    # 优化 1：在描述中严厉警告模型，规范其行为
-    description: str = "将文本转为语音发送的工具。当用户明确要求你发语音、说话或表达情感时调用。注意：每次回复【仅限调用一次】，请将所有要说的话合并到一起传入！调用成功后请直接结束回复，切勿重复调用！"
+    # 进一步强化工具描述的限制感
+    description: str = "核心语音工具。每次对话【绝对只能调用一次】，请将所有话合并为一段长文本传入。调用后必须直接结束回复，严禁连续调用！"
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": "需要转换为语音的纯文本。务必将所有要说的话合并成一段完整的长文本传入。如果你需要表达情绪，必须在正文开头加上情绪指令前缀，格式为：[情绪词] emotion<|endofprompt|>[正文]。支持的情绪词有：happy, excited, sad, angry。例如：'happy emotion<|endofprompt|>今天天气真好！'",
+                    "description": "要转换为语音的纯文本。务必将所有话合并成一段完整的长文本。如需表达情绪，在正文开头加上情绪指令前缀，格式为：[情绪词] emotion<|endofprompt|>[正文]。",
                 }
             },
             "required": ["text"],
@@ -1004,10 +1004,11 @@ class VITSTool(FunctionTool[AstrAgentContext]):
     async def call(
         self, context: ContextWrapper[AstrAgentContext], **kwargs
     ) -> ToolExecResult:
-        # 优化 2：单次回复防重复调用锁（硬拦截）
+        
+        # 【修改点 1】拦截后不要报“错误”，而是假装成功并下达停止指令
         if context.context.event.get_extra("vits_tool_called"):
             logger.warning("大模型尝试重复调用语音工具，已拦截")
-            return "错误：你已经在此次回复中调用过语音工具了！请立即停止调用，并直接结束你的对话回复。"
+            return "【系统指令】动作已被忽略，因为刚才语音已成功发送！请立即停止调用本工具。请直接回复一个标点符号（如“。”）来结束本次对话。"
         
         # 标记为已调用
         context.context.event.set_extra("vits_tool_called", True)
@@ -1029,36 +1030,29 @@ class VITSTool(FunctionTool[AstrAgentContext]):
         final_audio_path, tmp_audio_path = self.plugin._generate_unique_audio_paths()
         
         try:
-            # 格式化文本（移除特定符号等，复用插件原有逻辑）
             tts_input = await self.plugin._build_tts_input(text)
-            
-            # 发送请求
             success = await self.plugin._create_speech_request(tts_input, tmp_audio_path)
             
             if success:
                 import os
-                # 原子替换
                 os.replace(tmp_audio_path, final_audio_path)
                 
-                # 直接通过 context.event 发送生成的音频记录
                 await context.context.event.send(
                     context.context.event.chain_result([Record(file=str(final_audio_path))])
                 )
                 
-                # 如果配置了调用工具后不发送文字，则设置静音 Flag
                 if not getattr(self.plugin, 'enable_llm_response', False):
                     context.context.event.set_extra("voice_silence_mode", True)
                     
-                # 触发一次音频文件清理
                 try:
                     self.plugin._enforce_audio_retention()
                 except Exception:
                     pass
                     
-                # 优化 3：工具返回结果中再次诱导大模型停止思考
-                return "语音发送成功，请立即结束本次对话回复，不要再输出任何后续内容。"
+                # 【修改点 2】成功后，给出极其明确的下车指令，诱导模型输出文字打破死循环
+                return "【系统指令】语音已成功发送至用户！任务圆满完成。禁止再次调用本工具！请直接回复一个标点符号（如“。”）来结束本次对话。"
             else:
-                return "语音合成失败"
+                return "【系统指令】合成失败，请直接文字回复用户，不要再尝试调用语音工具。"
         except Exception as e:
             logger.error(f"VITSTool 调用失败: {e}")
-            return f"语音合成发生异常: {str(e)}"
+            return f"【系统指令】发生异常: {str(e)}。请直接用文字回复用户，切勿重试工具。"
