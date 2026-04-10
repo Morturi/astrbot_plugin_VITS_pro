@@ -3,6 +3,12 @@ from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger
 from astrbot.api.message_components import Record, Plain, Image, At, Reply, AtAll
 from pathlib import Path
+from pydantic import Field
+from pydantic.dataclasses import dataclass
+from astrbot.core.agent.tool import FunctionTool, ToolExecResult
+from astrbot.core.agent.run_context import ContextWrapper
+from astrbot.core.astr_agent_context import AstrAgentContext
+from astrbot.core.provider.entities import LLMResponse
 import re
 import aiohttp
 import json
@@ -39,6 +45,13 @@ class VITSPlugin(Star):
         self.only_llm_tts = bool(config.get('only_llm_tts', False))  # 仅对AI模型回复进行TTS
         # 新增：最大保存音频文件数量（0=不限制）
         self.max_saved_audios = int(config.get('max_saved_audios', 5))
+        # 解析 LLM 工具相关配置
+        self.enable_llm_tool = bool(config.get("enable_llm_tool", True))
+        self.enable_llm_response = bool(config.get("enable_llm_response", False))
+        
+        # 注册 LLM 工具
+        if self.enable_llm_tool:
+            self.context.add_llm_tools(VITSTool(plugin=self))
         # 访问控制：模式 + 列表
         self.group_access_mode = self._normalize_access_mode(config.get('group_access_mode', 'disabled'))
         self.group_access_list = config.get('group_access_list', [])
@@ -949,3 +962,93 @@ class VITSPlugin(Star):
         # 传递会话键，用于去重
         session_key = getattr(event, 'unified_msg_origin', None) or event.get_session_id()
         await self._convert_to_speech(event, result, session_key)
+    
+    @filter.on_llm_response()
+    async def handle_silence(self, event: AstrMessageEvent, resp: LLMResponse):
+        """处理模型调用工具后的文本静音"""
+        if event.get_extra("voice_silence_mode"):
+            # 1. 消除标记
+            event.set_extra("voice_silence_mode", False)
+            
+            # 2. 核心：将模型的文本强制修改为 \u200b (零宽空格)
+            # 这样做的效果是绕过空消息检测，但用户在前端看不见任何文字，实现只发语音的效果。
+            resp.completion_text = "\u200b"
+            
+            # 3. 停止事件防止后续可能的冗余处理
+            event.stop_event()
+
+
+# ==========================================
+# 注意：VITSTool 必须定义在 VITSPlugin 类的外面（顶层缩进）
+# ==========================================
+@dataclass
+class VITSTool(FunctionTool[AstrAgentContext]):
+    name: str = "vits_speech_synthesis" 
+    description: str = "将文本转为语音发送的工具。当用户明确要求你发语音、说话、或你需要用语音表达情感时调用。"
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "需要转换为语音的纯文本。如果你需要表达情绪，必须在正文开头加上情绪指令前缀，格式为：[情绪词] emotion<|endofprompt|>[正文]。支持的情绪词有：happy, excited, sad, angry。例如：'happy emotion<|endofprompt|>今天天气真好！'",
+                }
+            },
+            "required": ["text"],
+        }
+    )
+
+    plugin: object = Field(default=None, repr=False)
+
+    async def call(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> ToolExecResult:
+        text = kwargs.get("text")
+        
+        if not self.plugin:
+            return "插件未正确初始化"
+        if not getattr(self.plugin, 'enable_llm_tool', True):
+            return "语音合成工具当前未启用"
+        if not text:
+            return "文本不能为空"
+
+        # 检查长度限制
+        if self.plugin.max_tts_chars > 0 and len(str(text)) > self.plugin.max_tts_chars:
+            return f"文本长度超出限制 ({self.plugin.max_tts_chars})"
+
+        # 生成路径并请求API
+        final_audio_path, tmp_audio_path = self.plugin._generate_unique_audio_paths()
+        
+        try:
+            # 格式化文本（移除特定符号等，复用插件原有逻辑）
+            tts_input = await self.plugin._build_tts_input(text)
+            
+            # 发送请求
+            success = await self.plugin._create_speech_request(tts_input, tmp_audio_path)
+            
+            if success:
+                import os
+                # 原子替换
+                os.replace(tmp_audio_path, final_audio_path)
+                
+                # 直接通过 context.event 发送生成的音频记录
+                await context.context.event.send(
+                    context.context.event.chain_result([Record(file=str(final_audio_path))])
+                )
+                
+                # 如果配置了调用工具后不发送文字，则设置静音 Flag
+                if not getattr(self.plugin, 'enable_llm_response', False):
+                    context.context.event.set_extra("voice_silence_mode", True)
+                    
+                # 触发一次音频文件清理
+                try:
+                    self.plugin._enforce_audio_retention()
+                except Exception:
+                    pass
+                    
+                return "语音发送成功"
+            else:
+                return "语音合成失败"
+        except Exception as e:
+            logger.error(f"VITSTool 调用失败: {e}")
+            return f"语音合成发生异常: {str(e)}"
