@@ -111,5 +111,17 @@
         "type": "list",
         "hint": "这些符号会在TTS前被删除，例如默认值中的 + - = / 等，用户可自行增删",
         "default": ["+", "-", "=", "/"]
+    },
+    "enable_llm_tool": {
+        "description": "允许大模型主动调用TTS工具",
+        "type": "bool",
+        "hint": "开启后，大模型作为Agent可以通过工具自主决定何时发送语音（需要大模型支持Function Calling）",
+        "default": true
+    },
+    "enable_llm_response": {
+        "description": "工具调用时是否保留大模型文本",
+        "type": "bool",
+        "hint": "关闭后，大模型主动调用语音时将只发送语音，不发送文字。开启则语音文字一起发送。",
+        "default": false
     }
 }
